@@ -5,7 +5,7 @@ and opt-in recovery for Codex conversations interrupted by quota limits.
 
 Windows Codex 额度悬浮窗：查看剩余额度与重置时间，并可手动开启额度恢复后的任务接续。
 
-**Current version: 1.1.2.** Softer glass borders, improved secondary text contrast, and aligned glass layers after resizing.
+**Current version: 1.1.3.** Softer glass borders, improved text contrast, aligned glass layers, and a matching blue tray icon.
 
 ![Offline demonstration](docs/preview.png)
 

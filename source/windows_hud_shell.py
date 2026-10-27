@@ -11,7 +11,7 @@ class WindowsHUDShell:
     HOTKEY = 0x5148
     PASS_HOTKEY = 0x5150
 
-    def __init__(self):
+    def __init__(self, icon_handle=None):
         self.events = queue.SimpleQueue()
         self.ready = False
         self.hotkey = False
@@ -22,6 +22,9 @@ class WindowsHUDShell:
         self.hidden = False
         self.hwnd = None
         self.error = ''
+        # The caller transfers ownership of a custom HICON to this shell.
+        self._owned_icon = int(icon_handle) if icon_handle else None
+        self.user = None
         if os.name != 'nt':
             self.error = '托盘与全局快捷键仅支持 Windows'
             return
@@ -92,7 +95,7 @@ class WindowsHUDShell:
         self.icon_data.hwnd, self.icon_data.id = self.hwnd, 1
         self.icon_data.flags = 1 | 2 | 4
         self.icon_data.callback = self.CALLBACK
-        self.icon_data.icon = self.user.LoadIconW(None, C.c_void_p(32512))
+        self.icon_data.icon = self._owned_icon or self.user.LoadIconW(None, C.c_void_p(32512))
         self.icon_data.tip = 'Codex 额度 HUD · 自动接续已关闭'
         self.ready = bool(self.shell.Shell_NotifyIconW(0, C.byref(self.icon_data)))
         if not self.ready:
@@ -167,6 +170,7 @@ class WindowsHUDShell:
             if getattr(self, 'atom', None):
                 self.user.UnregisterClassW(self.class_name, self.instance)
                 self.atom = None
+            self._release_icon()
             return
         if hasattr(self, 'icon_data'):
             self.shell.Shell_NotifyIconW(2, C.byref(self.icon_data))
@@ -179,3 +183,16 @@ class WindowsHUDShell:
         self.user.UnregisterClassW(self.class_name, self.instance)
         self.atom = None
         self.ready = self.hotkey = self.pass_hotkey = False
+        self._release_icon()
+
+    def _release_icon(self):
+        handle, self._owned_icon = self._owned_icon, None
+        if not handle or os.name != 'nt':
+            return
+        try:
+            user = self.user or C.WinDLL('user32', use_last_error=True)
+            user.DestroyIcon.argtypes, user.DestroyIcon.restype = [W.HICON], W.BOOL
+            if not user.DestroyIcon(handle):
+                self.error = '无法释放托盘图标'
+        except OSError as exc:
+            self.error = str(exc)

@@ -64,6 +64,45 @@ class GlassUITests(unittest.TestCase):
         self.assertEqual(sizes, {(30, 30)})
         self.assertEqual(len(centers), 1)
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows system tray integration')
+    def test_tray_uses_the_hud_icon_instead_of_windows_generic_icon(self):
+        import ctypes as C
+        from PySide6.QtGui import QImage
+
+        hud = GlassHUD(DemoService(), demo=True)
+        handle = None
+        try:
+            self.assertTrue(hud.shell.ready, hud.shell.error)
+            handle = hud.shell.icon_data.icon
+            generic = hud.shell.user.LoadIconW(None, C.c_void_p(32512))
+            self.assertNotEqual(handle, generic)
+            image = QImage.fromHICON(handle)
+            self.assertFalse(image.isNull())
+            color = image.pixelColor(image.width() // 5, image.height() // 2)
+            self.assertGreater(color.blue(), 200)
+            self.assertLess(color.red(), 40)
+        finally:
+            hud.close()
+        # A custom HICON belongs to the application and must be released.
+        self.assertFalse(hud.shell.user.DestroyIcon(handle))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows system tray integration')
+    def test_custom_tray_icon_is_released_if_shell_initialization_fails(self):
+        import ctypes as C
+        from ctypes import wintypes as W
+        from PySide6.QtGui import QImage, QColor
+        from windows_hud_shell import WindowsHUDShell
+
+        image = QImage(16, 16, QImage.Format.Format_ARGB32)
+        image.fill(QColor('#007AFF'))
+        handle = image.toHICON()
+        with patch.object(WindowsHUDShell, '_initialize', side_effect=OSError('test failure')):
+            shell = WindowsHUDShell(handle)
+        self.assertFalse(shell.ready)
+        user = C.WinDLL('user32', use_last_error=True)
+        user.DestroyIcon.argtypes, user.DestroyIcon.restype = [W.HICON], W.BOOL
+        self.assertFalse(user.DestroyIcon(handle))
+
     def test_missing_blur_keeps_background_readable(self):
         self.hud.set_transparency(80)
         image = self.hud.grab().toImage()

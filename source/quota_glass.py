@@ -277,7 +277,8 @@ class GlassHUD(QWidget):
         self.glass_mode = 'fallback'
         self.pass_switch = self.pass_state = self.pass_hint = None
         self.setWindowTitle('Codex 额度管家' + (' — 离线演示' if demo else ''))
-        self.setWindowIcon(app_icon())
+        icon = app_icon()
+        self.setWindowIcon(icon)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint |
                             (Qt.WindowType.WindowStaysOnTopHint if self.pinned else Qt.WindowType.Widget))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -285,7 +286,16 @@ class GlassHUD(QWidget):
         self.setStyleSheet('QToolTip{color:#17243A;background:#F5F7FB;border:1px solid #DCE3EE;padding:6px;border-radius:6px;}')
         self._build()
         self.adjustSize()
-        self.shell = shell if shell is not None else WindowsHUDShell()
+        if shell is not None:
+            self.shell = shell
+        else:
+            native_icon = None
+            if os.name == 'nt':
+                try:
+                    native_icon = icon.pixmap(32, 32).toImage().toHICON()
+                except (AttributeError, OSError, TypeError, RuntimeError):
+                    pass  # The system icon remains a usable fallback.
+            self.shell = WindowsHUDShell(native_icon)
         self.pin_button.setChecked(self.pinned)
         if not self.shell.hotkey:
             self.minimize_button.setToolTip('隐藏到托盘（Ctrl+Alt+H 被其他程序占用）')
@@ -955,6 +965,8 @@ def main(argv=None):
                 report = dict(glass_mode=hud.glass_mode,
                               backdrop_handle=int(backdrop.Handle.ToInt64()) if backdrop else 0,
                               error=effects.error if effects else 'No native effects',
+                              tray_ready=hud.shell.ready,
+                              tray_icon_custom=bool(getattr(hud.shell, '_owned_icon', None)),
                               desktop_pixels_verified=False)
                 with open(args.demo_report, 'w', encoding='utf-8') as stream:
                     json.dump(report, stream, indent=2)
