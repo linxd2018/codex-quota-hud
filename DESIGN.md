@@ -10,11 +10,12 @@ palette, typography hierarchy and restrained blue to a desktop glass material.
 It is not an official Apple iOS specification.
 
 ## Visual system
-- Pearl #F5F5F7, ink #1D1D1F, secondary #63636B, action #007AFF.
+- Pearl #F5F5F7, ink #1D1D1F, secondary #354750, action #007AFF.
 - Keep red/off and green/on semantics for existing automation controls.
 - Native Windows Composition backdrop provides real desktop blur.
-- Translucent neutral white shell, fine light rim, soft upper highlight.
-- Separate rounded quota tiles; primary quota has a large left-aligned numeral.
+- Translucent neutral white shell with a single low-contrast slate outline.
+- Separate rounded quota tiles use a lighter fill and a quieter outline than the shell;
+  primary quota has a large left-aligned numeral.
 - Segoe UI Variable Display for numbers; Microsoft YaHei UI for Chinese.
 - 428 logical pixels wide; 22px outer inset, 18px card inset, 12px spacing.
 - Keep text opaque. If blur is unavailable, use a readable near-opaque surface.

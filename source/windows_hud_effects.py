@@ -22,6 +22,7 @@ class WindowEffects:
         self._backdrop = None
         self._original_topmost = None
         self._rounded = False
+        self._rounded_geometry = None
         self.user = None
         if os.name != 'nt':
             self.error = 'Windows effects require Windows'
@@ -71,6 +72,9 @@ class WindowEffects:
                 dpi = dpi_fn(self.hwnd)
                 if not dpi:
                     raise OSError('HUD window DPI unavailable')
+            geometry = (width, height, dpi, float(radius))
+            if self._rounded and self._rounded_geometry == geometry:
+                return True
             diameter = max(2, min(width, height, round(float(radius) * dpi / 96 * 2)))
             gdi = C.WinDLL('gdi32', use_last_error=True)
             gdi.CreateRoundRectRgn.argtypes = [C.c_int] * 6
@@ -83,6 +87,7 @@ class WindowEffects:
                 raise OSError('Windows rejected rounded HUD region')
             region = None  # owned by Windows now; never DeleteObject this handle
             self._rounded = True
+            self._rounded_geometry = geometry
             self.error = ''
             return True
         except (OSError, ValueError, OverflowError) as exc:
@@ -281,6 +286,7 @@ class WindowEffects:
                 if not self.user.SetWindowRgn(self.hwnd, None, True):
                     raise OSError('Could not clear rounded HUD region')
                 self._rounded = False
+                self._rounded_geometry = None
             except OSError as exc:
                 self.error = str(exc)
         self._closed = True

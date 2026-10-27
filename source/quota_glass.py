@@ -26,7 +26,7 @@ from windows_hud_effects import WindowEffects
 import follow_gpt
 
 GREEN, RED, BLUE = '#30B66C', '#E45D69', '#007AFF'
-INK, MUTED = '#1D1D1F', '#63636B'
+INK, MUTED = '#1D1D1F', '#354750'
 STATE_NAMES = {'pending': '等待额度 / 待重试', 'sending': '正在投递', 'queued': '已投递，等待确认',
     'uncertain': '投递不明，请核查', 'confirmed': '已确认本次接续', 'superseded': '会话已由其他操作继续',
     'observed': '已发现后续轮次（旧记录）', 'ignored': '已忽略'}
@@ -429,26 +429,18 @@ class GlassHUD(QWidget):
         gradient.setColorAt(.45, QColor(248, 248, 250, alpha))
         gradient.setColorAt(1, QColor(242, 242, 247, min(255, alpha+18)))
         painter.setBrush(gradient)
-        painter.setPen(QPen(QColor(255, 255, 255, 220), 1.2))
+        # One quiet outline gives the glass an edge without a second bright rim.
+        painter.setPen(QPen(QColor(39, 67, 76, 68), 1.0))
         painter.drawRoundedRect(rect, 26, 26)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor(60, 60, 67, 25), .8))
-        painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 25, 25)
-        # A restrained upper rim catches light without a colored glow.
-        rim = QLinearGradient(rect.topLeft(), QPointF(0, 70))
-        rim.setColorAt(0, QColor(255, 255, 255, 110))
-        rim.setColorAt(1, QColor(255, 255, 255, 0))
-        painter.setPen(QPen(rim, 1.4))
-        painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 24, 24)
 
     def _style_surfaces(self):
         alphas = surface_alphas(self.transparency)
         self.quota_card.setStyleSheet(
             'QFrame#quotaCard{background:transparent;border:none;}'
             'QFrame#quotaTile{background:rgba(255,255,255,%s);'
-            'border:1px solid rgba(255,255,255,180);border-radius:20px;}' %
+            'border:1px solid rgba(39,67,76,28);border-radius:20px;}' %
             min(255, alphas['card'] + 32))
-        self.controls_card.setStyleSheet('QFrame#controls{background:rgba(255,255,255,%s);border:1px solid rgba(255,255,255,155);border-radius:20px;}' % (alphas['controls'] + 24))
+        self.controls_card.setStyleSheet('QFrame#controls{background:rgba(255,255,255,%s);border:1px solid rgba(39,67,76,24);border-radius:20px;}' % (alphas['controls'] + 24))
         self.update()
 
     def set_transparency(self, value):
@@ -517,8 +509,9 @@ class GlassHUD(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if getattr(self, 'effects', None):
-            self.effects.round_corners(26)
             self._sync_backdrop()
+            # Qt can emit resize before Windows reports the new client size.
+            QTimer.singleShot(0, self._sync_backdrop)
 
     def moveEvent(self, event):
         super().moveEvent(event)
@@ -534,6 +527,9 @@ class GlassHUD(QWidget):
     def _sync_backdrop(self):
         if self.closed or not getattr(self,'effects',None):
             return
+        # Keep the foreground region aligned even if native resize completed
+        # after the Qt event; unchanged geometry does not reset the region.
+        self.effects.round_corners(26)
         sync = getattr(self.effects,'sync_backdrop',None)
         if sync and not sync() and self.glass_mode == 'acrylic':
             self.glass_mode = 'fallback'

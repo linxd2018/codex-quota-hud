@@ -71,6 +71,39 @@ class GlassUITests(unittest.TestCase):
         self.assertGreaterEqual(image.pixelColor(10, 100).alpha(), 235)
         self.assertEqual(self.hud.windowOpacity(), 1.)
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows owned HWND integration')
+    def test_native_rounding_tracks_actual_client_size(self):
+        import ctypes as C
+        from ctypes import wintypes as W
+
+        hud = GlassHUD(DemoService(), demo=True, shell=FakeShell())
+        gdi = C.WinDLL('gdi32', use_last_error=True)
+        gdi.CreateRectRgn.argtypes, gdi.CreateRectRgn.restype = [C.c_int] * 4, W.HANDLE
+        gdi.GetRgnBox.argtypes, gdi.GetRgnBox.restype = [W.HANDLE, C.POINTER(W.RECT)], C.c_int
+        gdi.DeleteObject.argtypes, gdi.DeleteObject.restype = [W.HANDLE], W.BOOL
+        region = gdi.CreateRectRgn(0, 0, 0, 0)
+        try:
+            hud.set_transparency(80)
+            hud.show()
+            QTest.qWait(500)
+            user = hud.effects.user
+            user.GetWindowRgn.argtypes, user.GetWindowRgn.restype = [W.HWND, W.HANDLE], C.c_int
+
+            def assert_region_matches_client():
+                client, bounds = W.RECT(), W.RECT()
+                self.assertTrue(user.GetClientRect(hud.effects.hwnd, C.byref(client)))
+                self.assertEqual(user.GetWindowRgn(hud.effects.hwnd, region), 3)
+                self.assertNotEqual(gdi.GetRgnBox(region, C.byref(bounds)), 0)
+                self.assertEqual((bounds.right, bounds.bottom), (client.right, client.bottom))
+
+            assert_region_matches_client()
+            hud.resize(hud.width(), hud.height() + 37)
+            QTest.qWait(500)
+            assert_region_matches_client()
+        finally:
+            gdi.DeleteObject(region)
+            hud.close()
+
     def test_quota_text_fits_at_normal_and_unknown_values(self):
         for value in ('100%', '未知'):
             for widget in self.hud.quota_values:
