@@ -526,6 +526,39 @@ def latest_turn(thread_id):
         con.close()
 
 
+def execution_snapshot():
+    """Read current root turns; unknown states reserve a slot, and read errors propagate.
+
+    Never expire an in-progress turn by age: a long turn or an approval can be
+    legitimate. Only a later terminal record is evidence that its slot is free.
+    """
+    state = readonly_connection(os.path.join(CODEX_DIR, "state_5.sqlite"))
+    history = None
+    try:
+        history = readonly_connection(os.path.join(CODEX_DIR, "thread_history_1.sqlite"))
+        roots = {row[0] for row in state.execute(
+            "SELECT id,archived,agent_path,source FROM threads")
+            if not row[1] and not row[2] and "subagent" not in (row[3] or "").lower()}
+        rows = history.execute("""SELECT t.thread_id,t.turn_id,t.status,t.error_json,t.completed_at
+            FROM thread_turns t JOIN
+            (SELECT thread_id,MAX(rowid) AS latest_row FROM thread_turns GROUP BY thread_id) x
+            ON t.rowid=x.latest_row""").fetchall()
+        turns, active, unknown = {}, set(), set()
+        for tid, turn_id, status, error, completed_at in rows:
+            if tid not in roots:
+                continue
+            turns[tid] = dict(turn_id=turn_id, status=status, error=error, completed_at=completed_at)
+            if status not in ("completed", "failed", "interrupted", "cancelled"):
+                active.add(tid)
+                if status != "inProgress":
+                    unknown.add(tid)
+        return dict(active_thread_ids=active, unknown_thread_ids=unknown, turns=turns)
+    finally:
+        if history is not None:
+            history.close()
+        state.close()
+
+
 def discover_events(con, args):
     items = read_latest_events(args.lookback_hours, args.thread, args.cwd)
     now = time.time()

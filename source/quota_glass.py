@@ -16,7 +16,7 @@ from PySide6.QtGui import QColor, QPainter, QPainterPath, QLinearGradient, QPen,
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QFrame, QToolButton, QAbstractButton, QSizePolicy, QDialog, QFormLayout,
     QLineEdit, QPushButton, QFileDialog, QMessageBox, QCheckBox, QTableWidget,
-    QTableWidgetItem, QHeaderView, QTextEdit, QSlider)
+    QTableWidgetItem, QHeaderView, QTextEdit, QSlider, QScrollArea, QLayout)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from quota_hud import remaining, percent, countdown, freshness, read_json, discover_runtime, DemoService, log_error, clamp_position
@@ -24,6 +24,8 @@ from hud_controls import ClickthroughControl, window_title, health_label
 from windows_hud_shell import WindowsHUDShell
 from windows_hud_effects import WindowEffects
 import follow_gpt
+from task_queue_ui import (TaskComposer, TaskQueueDialog, ConcurrentSpinBox,
+                           normalized_max_concurrent_tasks)
 
 GREEN, RED, BLUE = '#30B66C', '#E45D69', '#007AFF'
 INK, MUTED = '#1D1D1F', '#354750'
@@ -262,6 +264,7 @@ class GlassHUD(QWidget):
         self.last = {}
         self.drag_offset = None
         self.records_dialog = self.settings_dialog = None
+        self.task_queue_dialog = None
         self._requested_passthrough = False
         self._pass_timer = QTimer(self)
         self._pass_timer.setSingleShot(True)
@@ -271,6 +274,10 @@ class GlassHUD(QWidget):
             os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'CodexQuotaWatchdog')
         self.settings_path = os.path.join(directory, 'hud-settings.json')
         self.preferences = {} if demo else read_json(self.settings_path)
+        self.max_concurrent_tasks = normalized_max_concurrent_tasks(self.preferences.get('maxConcurrentTasks'))
+        self.preferences['maxConcurrentTasks'] = self.max_concurrent_tasks
+        if hasattr(service, 'set_max_concurrent_tasks'):
+            service.set_max_concurrent_tasks(self.max_concurrent_tasks)
         self.pinned = self.preferences.get('pinned', True) is not False
         self.glass = self.preferences.get('glass', True) is not False
         self.transparency = normalized_transparency(self.preferences.get('transparency', 55))
@@ -304,7 +311,8 @@ class GlassHUD(QWidget):
         QShortcut(QKeySequence('Ctrl+R'), self, activated=self.refresh)
         QShortcut(QKeySequence('Ctrl+,'), self, activated=self.settings)
         QShortcut(QKeySequence('Ctrl+L'), self, activated=self.records)
-        QShortcut(QKeySequence('Escape'), self, activated=self.minimize)
+        QShortcut(QKeySequence('Escape'), self, activated=self._escape)
+        QShortcut(QKeySequence('Ctrl+N'), self, activated=self.toggle_task_composer)
         self.timer = QTimer(self)
         self.timer.setInterval(200)
         self.timer.timeout.connect(self._poll)
@@ -317,6 +325,7 @@ class GlassHUD(QWidget):
 
     def _build(self):
         outer = QVBoxLayout(self)
+        self.outer_layout = outer
         outer.setContentsMargins(22, 22, 22, 16)
         outer.setSpacing(12)
         top = QHBoxLayout()
@@ -392,8 +401,21 @@ class GlassHUD(QWidget):
         controls_layout = QVBoxLayout(controls)
         controls_layout.setContentsMargins(16, 11, 16, 11)
         controls_layout.setSpacing(10)
-        self.auto_switch, self.auto_state = self._switch_row(controls_layout, '自动接续', '额度恢复后继续原任务', self.toggle_automation)
+        self.auto_switch, self.auto_state = self._switch_row(controls_layout, '自动接续', '额度恢复后接续原任务并启动队列', self.toggle_automation)
         outer.addWidget(controls)
+
+        task_row = QHBoxLayout()
+        self.new_task_button = QPushButton('＋ 新任务')
+        self.new_task_button.setAccessibleName('新任务')
+        self.new_task_button.setToolTip('展开任务输入  Ctrl+N')
+        self.new_task_button.clicked.connect(self.toggle_task_composer)
+        self.queue_button = QPushButton('任务队列  0')
+        self.queue_button.clicked.connect(self.open_task_queue)
+        for button in (self.new_task_button, self.queue_button):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet('QPushButton{background:rgba(255,255,255,130);color:#354750;border:1px solid rgba(39,67,76,30);border-radius:10px;padding:7px 11px;} QPushButton:hover{background:rgba(255,255,255,210);color:#007AFF;}')
+            task_row.addWidget(button)
+        outer.addLayout(task_row)
 
         footer = QHBoxLayout()
         self.fresh_label = label('等待额度数据', 8, MUTED)
@@ -402,6 +424,86 @@ class GlassHUD(QWidget):
         footer.addWidget(self.material_label)
         footer.addWidget(self._tool('settings', '设置', self.settings, 28))
         outer.addLayout(footer)
+
+        self.task_composer = TaskComposer(self.service, self.preferences, self._save_preferences, self)
+        self.task_composer.dismissed.connect(self._hide_task_composer)
+        self.task_composer.submitted.connect(self._task_submitted)
+        self.task_scroll = QScrollArea()
+        self.task_scroll.setWidgetResizable(True)
+        self.task_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.task_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.task_scroll.setStyleSheet('QScrollArea{background:transparent;border:0;} QScrollBar:vertical{width:7px;background:transparent;} QScrollBar::handle:vertical{background:#B9C5CF;border-radius:3px;min-height:24px;} QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}')
+        self.task_scroll.setWidget(self.task_composer)
+        self.task_scroll.setMinimumHeight(0)
+        self.task_scroll.hide()
+        outer.addWidget(self.task_scroll)
+
+    def toggle_task_composer(self):
+        self._restore_for_dialog()
+        showing = not self.task_scroll.isVisible()
+        self.task_scroll.setVisible(showing)
+        self.new_task_button.setText('收起输入' if showing else '＋ 新任务')
+        self._resize_for_composer()
+        if showing:
+            self.task_composer.apply_snapshot(self.service.snapshot())
+            self.task_composer.refresh_capabilities()
+            self.task_composer.description.setFocus()
+
+    def _hide_task_composer(self):
+        self.task_scroll.hide()
+        self.new_task_button.setText('＋ 新任务')
+        self._resize_for_composer()
+
+    def _resize_for_composer(self):
+        area = (self.screen() or QApplication.primaryScreen()).availableGeometry()
+        self.outer_layout.activate()
+        base = self.sizeHint().height() - (self.task_scroll.sizeHint().height() + self.outer_layout.spacing()
+            if self.task_scroll.isVisible() else 0)
+        if self.task_scroll.isVisible():
+            available = max(100, area.height() - 24 - base - self.outer_layout.spacing())
+            panel_height = min(self.task_composer.sizeHint().height() + 2, available)
+            self.task_scroll.setFixedHeight(panel_height)
+        else:
+            self.task_scroll.setMinimumHeight(0)
+            self.task_scroll.setMaximumHeight(16777215)
+        self.adjustSize()
+        # Use the current position; expanding must not jump to the last saved one.
+        self.move(*clamp_position(self.x(), self.y(), self.width(), self.height(),
+            [(area.left(), area.top(), area.right() + 1, area.bottom() + 1)]))
+        self._sync_backdrop()
+
+    def _escape(self):
+        if self.task_scroll.isVisible():
+            self._hide_task_composer()
+        else:
+            self.minimize()
+
+    def _task_submitted(self, message):
+        self._poll()
+
+    def open_task_queue(self):
+        self._restore_for_dialog()
+        if self.task_queue_dialog is None:
+            self.task_queue_dialog = TaskQueueDialog(self.service, self)
+            self._dialog_style(self.task_queue_dialog)
+            self.task_queue_dialog.edit_requested.connect(self._edit_queued_task)
+        self.task_queue_dialog.refresh(self.service.snapshot())
+        self.task_queue_dialog.show()
+        self.task_queue_dialog.raise_()
+
+    def _edit_queued_task(self, task):
+        if not self.task_scroll.isVisible():
+            self.toggle_task_composer()
+        self.task_composer.load_task(task)
+        self.task_composer.description.setFocus()
+
+    def set_max_concurrent_tasks(self, value):
+        if type(value) is not int or not 3 <= value <= 10:
+            raise ValueError('最大并发任务数必须是 3～10 的整数。')
+        self.service.set_max_concurrent_tasks(value)
+        self.max_concurrent_tasks = value
+        self.preferences['maxConcurrentTasks'] = value
+        self._save_preferences()
 
     def _tool(self, kind, tooltip, callback, size=30):
         button = IconButton(kind, tooltip, size=size)
@@ -685,6 +787,16 @@ class GlassHUD(QWidget):
         if snap.get('uncertain_count'):
             count += '   待核 %s' % snap['uncertain_count']
         self.count_label.setText(count)
+        tasks = snap.get('new_tasks') or []
+        waiting = sum(task.get('status') not in ('completed', 'cancelled') for task in tasks)
+        self.queue_button.setText('任务队列  %s' % waiting)
+        self.queue_button.setToolTip('运行 %s / 上限 %s%s' % (snap.get('running_task_count', 0),
+            snap.get('maxConcurrentTasks', self.max_concurrent_tasks),
+            ' · ' + str(snap['capacity_error']) if snap.get('capacity_error') else ''))
+        if self.task_scroll.isVisible():
+            self.task_composer.apply_snapshot(snap)
+        if self.task_queue_dialog and self.task_queue_dialog.isVisible():
+            self.task_queue_dialog.refresh(snap)
         if self.control:
             self.control.ensure_recoverable()
         self._reflect_controls()
@@ -805,6 +917,16 @@ class GlassHUD(QWidget):
         self.glass_checkbox.toggled.connect(change_glass)
 
         layout.addWidget(label('操作', 10, bold=True))
+        concurrency = QHBoxLayout()
+        concurrency.addWidget(label('最大并发任务数', 10), 1)
+        self.max_concurrent_spin = ConcurrentSpinBox()
+        self.max_concurrent_spin.setValue(self.max_concurrent_tasks)
+        self.max_concurrent_spin.valueChanged.connect(self.set_max_concurrent_tasks)
+        concurrency.addWidget(self.max_concurrent_spin)
+        layout.addLayout(concurrency)
+        concurrency_hint = label('3～10 个，立即生效。降低上限不会终止正在执行的任务。', 8, MUTED)
+        concurrency_hint.setWordWrap(True)
+        layout.addWidget(concurrency_hint)
         recovery = 'Ctrl+Alt+P 切换 · 托盘可解除' if self.shell.pass_hotkey else '从托盘解除 · 全局快捷键被占用'
         self.pass_switch, self.pass_state = self._switch_row(layout, '鼠标穿透', recovery, self.toggle_clickthrough)
         self._reflect_controls()

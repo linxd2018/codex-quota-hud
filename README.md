@@ -16,6 +16,10 @@ Windows Codex 额度悬浮窗：查看剩余额度与重置时间，并可手动
 - Tray, pinning, keyboard shortcuts, optional mouse passthrough and startup companion.
 - Automatic continuation is **off at startup** and must be enabled explicitly.
 - Local SQLite delivery tracking distinguishes queued, confirmed and uncertain results.
+- A persistent task queue accepts new work even when quota is exhausted. It starts new
+  Codex conversations after quota recovers and prioritizes interrupted conversations.
+- Settings lets you change the shared concurrency limit from 3 to 10. Lowering the
+  limit leaves existing turns running.
 
 This is an independent community project, not affiliated with OpenAI or Apple.
 It uses the local Codex CLI; changes to CLI protocols may affect compatibility.
@@ -41,6 +45,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File source/tools/build_backdrop.
 Omit `--demo` to connect to your local Codex account. Select CLI and Node paths
 in Settings if automatic discovery fails. Do not enable continuation unless
 you want interrupted tasks to resume using their existing permissions.
+
+Use **新任务** to compose a queued task and **任务队列** to check its status,
+change its priority, or handle an approval. The queue uses the installed CLI's
+model catalog and defaults to workspace write with on-request approval.
+Once a turn has been saved, its conversation can be opened in Codex desktop.
+Check the HUD for live progress and approvals on HUD-owned turns.
 
 ## Tests and build
 

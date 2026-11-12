@@ -3,6 +3,9 @@ import sys
 
 
 if __name__ == '__main__':
+    if '--task-worker' in sys.argv[1:]:
+        from task_worker import main as task_worker_main
+        raise SystemExit(task_worker_main())
     if sys.argv[1:] in (['--enable-follow-gpt'], ['--disable-follow-gpt']):
         from follow_gpt import set_enabled
         set_enabled(sys.argv[1] == '--enable-follow-gpt')

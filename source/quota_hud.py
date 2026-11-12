@@ -149,6 +149,8 @@ class DemoService:
     def __init__(self):
         self.enabled = False
         self.index = 0
+        self.tasks = []
+        self.max_concurrent_tasks = 3
         self.request_refresh()
     def start(self): pass
     def stop(self, timeout=2): self.enabled = False
@@ -156,14 +158,60 @@ class DemoService:
     def request_refresh(self):
         self.index += 1
         self.updated = time.time()
+    def set_max_concurrent_tasks(self, value):
+        if type(value) is not int or not 3 <= value <= 10:
+            raise ValueError('最大并发任务数必须是 3～10 的整数。')
+        self.max_concurrent_tasks = value
+    def request_task_capabilities(self): pass
+    def queue_submit(self, spec):
+        import uuid
+        if not str(spec.get('description', '')).strip() or not os.path.isdir(spec.get('cwd', '')):
+            raise ValueError('请输入任务描述并选择已有工作目录。')
+        task = dict(spec, id=uuid.uuid4().hex, status='pending', priority=0,
+            created_at=time.time(), updated_at=time.time(), started_at=None,
+            completed_at=None, thread_id=None, error=None, log_path=None)
+        self.tasks.append(task)
+        return dict(task)
+    def _task(self, task_id):
+        return next(task for task in self.tasks if task['id'] == task_id)
+    def queue_update(self, task_id, patch):
+        task = self._task(task_id)
+        if task.get('started_at') or task['status'] not in ('pending', 'waiting_quota', 'failed'):
+            raise ValueError('任务已经启动，无法修改。')
+        task.update(patch, updated_at=time.time())
+        return dict(task)
+    def queue_delete(self, task_id):
+        task = self._task(task_id)
+        if task.get('started_at') or task['status'] not in ('pending', 'waiting_quota', 'failed', 'cancelled'):
+            raise ValueError('任务已经启动，无法删除。')
+        task.update(status='cancelled', completed_at=time.time(), updated_at=time.time())
+    def queue_reprioritize(self, task_id, priority):
+        return self.queue_update(task_id, {'priority': priority})
+    def queue_retry(self, task_id):
+        task = self._task(task_id)
+        if task['status'] not in ('failed', 'waiting_authorization') or task.get('worker_pid'):
+            raise ValueError('仅执行失败或已停止等待授权的任务可重试。')
+        task.update(status='waiting_resume' if task.get('thread_id') else 'pending',
+                    error=None, approval=None, approval_response=None, updated_at=time.time())
+    def queue_respond_approval(self, task_id, displayed_request, decision):
+        task = self._task(task_id)
+        if task['status'] != 'waiting_authorization' or not task.get('approval'):
+            raise ValueError('此任务当前没有待授权请求。')
+        if decision not in ('accept', 'decline', 'cancel'):
+            raise ValueError('无效的授权决定。')
+        task.update(approval_response={'decision': decision}, updated_at=time.time())
     def snapshot(self):
+        import copy
         return dict(quota=dict(used=28 if self.index % 2 else 41,
                     secondary_used=46, window_minutes=300, secondary_window_minutes=10080,
                     reset_at=self.updated + 7350,
                     secondary_reset_at=self.updated + 215000),
                     quota_updated_at=self.updated, quota_error=None, refreshing=False,
                     enabled=self.enabled, status='离线演示 · 不连接账户',
-                    pending_count=0, queued_count=0, uncertain_count=0)
+                    pending_count=0, queued_count=0, uncertain_count=0,
+                    new_tasks=copy.deepcopy(self.tasks), task_capabilities={},
+                    maxConcurrentTasks=self.max_concurrent_tasks, running_task_count=0,
+                    reserved_task_count=0)
 
 
 class QuotaHUD:

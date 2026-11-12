@@ -7,13 +7,15 @@ import os
 import re
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 
 class WatchdogService:
     def __init__(self, core=None, poll_interval=60, thread_ids=None,
-                 directories=None, lookback_hours=72, display_mode=True, read_timeout=25):
+                 directories=None, lookback_hours=72, display_mode=True, read_timeout=25,
+                 max_concurrent_tasks=3):
         if core is None:
             import codex_watchdog as core
         self.core = core
@@ -29,12 +31,22 @@ class WatchdogService:
         self._thread = None
         self._instance = None
         self._generation = 0
+        self._max_concurrent_tasks = self._validate_max_concurrent_tasks(max_concurrent_tasks)
+        self._task_store = None
+        self._task_scheduler = None
+        self._capabilities_requested = False
+        self._dispatch_owner = str(uuid.uuid4())
+        self._dispatch_control_initialized = False
         self._data = dict(quota=None, quota_updated_at=None, quota_error=None,
                           refreshing=False, enabled=False, monitor_state='off',
                           status='自动接续已关闭', pending_count=0, queued_count=0,
                           uncertain_count=0, confirmed_count=0, superseded_count=0,
                           observed_count=0, recent_events=[], last_action='', phase='idle',
-                          phase_started_at=None, last_cycle_at=None)
+                          phase_started_at=None, last_cycle_at=None,
+                          maxConcurrentTasks=self._max_concurrent_tasks,
+                          running_task_count=0, reserved_task_count=0, capacity_error=None,
+                          new_tasks=[], task_capabilities=None, task_capabilities_loading=False,
+                          task_capabilities_error=None)
         self._root = os.path.dirname(os.path.abspath(core.STATE_DB))
         self._logger = logging.getLogger('watchdog.runtime.%s' % id(self))
         self._logger.setLevel(logging.INFO)
@@ -56,10 +68,157 @@ class WatchdogService:
             self._data['monitor_state'] = 'starting' if self._data['enabled'] else (
                 'stopping' if self._instance else 'off')
             self._data['status'] = '正在启动自动接续' if self._data['enabled'] else '自动接续已关闭'
+            self._publish_dispatch_control()
         self._wake.set()
 
     def request_refresh(self):
         self._wake.set()
+
+    @staticmethod
+    def _validate_max_concurrent_tasks(value):
+        from task_queue import validate_concurrency
+        return validate_concurrency(value)
+
+    def set_max_concurrent_tasks(self, value):
+        value = self._validate_max_concurrent_tasks(value)
+        with self._mutex:
+            self._max_concurrent_tasks = value
+            self._data['maxConcurrentTasks'] = value
+            self._publish_dispatch_control()
+        self._wake.set()
+
+    def _tasks(self):
+        with self._mutex:
+            if self._task_store is None:
+                from task_queue import TaskStore
+                self._task_store = TaskStore(path=self.core.STATE_DB)
+            return self._task_store
+
+    def _scheduler(self):
+        if self._task_scheduler is None:
+            from task_scheduler import TaskScheduler
+            self._task_scheduler = TaskScheduler(self.core, self._tasks(), prepare_dispatch=self._prepare_task_dispatch)
+        return self._task_scheduler
+
+    def _publish_dispatch_control(self):
+        if not self._dispatch_control_initialized:
+            return
+        quota = self._data.get('quota') or {}
+        data = dict(owner=self._dispatch_owner, generation=self._generation,
+                    enabled=self._active(), maxConcurrentTasks=self._max_concurrent_tasks,
+                    quota_available=quota.get('available') is True and not self._data.get('quota_error'),
+                    quota_confirmed_at=self._data.get('quota_updated_at'),
+                    expires_at=time.time()+max(120, self.poll_interval*3))
+        self._tasks().publish_dispatch_control(data)
+
+    def _prepare_task_dispatch(self, task):
+        with self._mutex:
+            self._dispatch_control_initialized = True
+            self._publish_dispatch_control()
+            return self._tasks().update(task['id'], dict(dispatch_owner=self._dispatch_owner,
+                dispatch_generation=self._generation), expected_status='starting',
+                expected_fields={'worker_token':task['worker_token']})
+
+    def queue_submit(self, spec):
+        task = self._tasks().submit(spec)
+        self._refresh_tasks()
+        self._wake.set()
+        return task
+
+    def queue_update(self, task_id, patch):
+        task = self._tasks().edit(task_id, patch)
+        self._refresh_tasks()
+        self._wake.set()
+        return task
+
+    def queue_delete(self, task_id):
+        result = self._tasks().delete(task_id)
+        self._refresh_tasks()
+        self._wake.set()
+        return result
+
+    def queue_reprioritize(self, task_id, priority):
+        result = self._tasks().reprioritize(task_id, priority)
+        self._refresh_tasks()
+        self._wake.set()
+        return result
+
+    def queue_retry(self, task_id):
+        result = self._tasks().retry(task_id)
+        self._refresh_tasks()
+        self._wake.set()
+        return result
+
+    def queue_respond_approval(self, task_id, displayed_request, decision):
+        result = self._tasks().respond_approval(task_id, displayed_request, decision)
+        self._refresh_tasks()
+        self._wake.set()
+        return result
+
+    def request_task_capabilities(self):
+        with self._mutex:
+            self._capabilities_requested = True
+            self._data.update(task_capabilities_loading=True, task_capabilities_error=None)
+        self._wake.set()
+
+    def _read_task_capabilities(self):
+        with self._mutex:
+            requested = self._capabilities_requested
+            self._capabilities_requested = False
+        if not requested:
+            return
+        try:
+            from codex_app_server import read_capabilities
+            self._update(task_capabilities=read_capabilities(self.core), task_capabilities_error=None)
+        except Exception as exc:
+            self._update(task_capabilities_error=self._safe(exc))
+        finally:
+            self._update(task_capabilities_loading=False)
+
+    def _refresh_tasks(self):
+        # Opening the old HUD in view-only mode must not create its database.
+        if self._task_store is None:
+            if not os.path.isfile(self.core.STATE_DB):
+                return []
+            con = self.core.readonly_connection(self.core.STATE_DB)
+            try:
+                if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='new_tasks'").fetchone():
+                    return []
+            finally:
+                con.close()
+        tasks = self._tasks().list_tasks()
+        self._update(new_tasks=tasks)
+        return tasks
+
+    def _capacity(self, con, sending_thread=None):
+        try:
+            # Injected legacy cores may predate scanning; production always has it.
+            scan = getattr(self.core, 'execution_snapshot', None)
+            current = scan() if scan else {'active_thread_ids': set()}
+            active = set(current['active_thread_ids'])
+            if sending_thread in active:
+                return False
+            reserved = {'thread:' + tid for tid in active}
+            for (tid,) in con.execute("SELECT DISTINCT thread_id FROM resume_events WHERE state IN ('sending','queued','uncertain')"):
+                reserved.add('thread:' + tid)
+            if self._task_scheduler:
+                reserved.update(self._task_scheduler.reservation_tokens())
+            running = {'thread:' + tid for tid in active}
+            if self._task_scheduler:
+                running.update(self._task_scheduler.running_tokens())
+            self._update(running_task_count=len(running), reserved_task_count=len(reserved), capacity_error=None)
+            if self._task_scheduler:
+                confirmed = self._data.get('quota_updated_at') or 0
+                if any(task.get('error_kind') == 'quota' and task['updated_at'] > confirmed
+                       for task in self._tasks().list_tasks()):
+                    return False
+            if sending_thread:
+                reserved.discard('thread:' + sending_thread)
+            return len(reserved) < self._max_concurrent_tasks
+        except Exception as exc:
+            self._update(capacity_error=self._safe(exc))
+            self._log('capacity scan failed; dispatch paused: %s' % exc)
+            return False
 
     def stop(self, timeout=2):
         self._shutdown.set()
@@ -221,16 +380,17 @@ class WatchdogService:
 
     def _read_history(self):
         # Existing own database only: no schema creation, discovery or reconciliation.
-        if not os.path.isfile(self.core.STATE_DB):
-            self._update(pending_count=0, queued_count=0, uncertain_count=0,
-                         confirmed_count=0, superseded_count=0, observed_count=0,
-                         recent_events=[])
-            return
-        con = self.core.readonly_connection(self.core.STATE_DB)
-        try:
-            self._counts(con)
-        finally:
-            con.close()
+        if os.path.isfile(self.core.STATE_DB):
+            con = self.core.readonly_connection(self.core.STATE_DB)
+            try:
+                if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='resume_events'").fetchone():
+                    self._counts(con)
+                    return
+            finally:
+                con.close()
+        self._update(pending_count=0, queued_count=0, uncertain_count=0,
+                     confirmed_count=0, superseded_count=0, observed_count=0,
+                     recent_events=[])
 
     @staticmethod
     def _stale_block(quota):
@@ -292,6 +452,9 @@ class WatchdogService:
             if not self._active(generation):
                 return
             tid, turn = item['thread_id'], item['turn_id']
+            if self._task_scheduler and tid in self._task_scheduler.owned_thread_ids():
+                self.core.set_event(con, tid, turn, 'queue_owned', '由新任务队列使用原会话 UUID 接续')
+                continue
             if not self._eligible(tid):
                 self.core.set_event(con,tid,turn,'ignored','会话已归档或为子代理')
                 continue
@@ -308,6 +471,8 @@ class WatchdogService:
             with self._mutex:
                 if not self._active(generation):
                     return
+                if not self._capacity(con):
+                    return
                 self.core.set_event(con,tid,turn,'sending')
                 self._update(monitor_state='sending',status='正在投递原会话续接')
             self._heartbeat()
@@ -319,7 +484,7 @@ class WatchdogService:
                 with self._stage('queue_resume'):
                     guarded = getattr(self.core, 'queue_resume_guarded', None)
                     if guarded:
-                        ok, detail = guarded(item, lambda: self._active(generation))
+                        ok, detail = guarded(item, lambda: self._active(generation) and self._capacity(con, tid))
                     else:
                         ok, detail = self.core.queue_resume(item)
             except Exception as exc:
@@ -329,6 +494,19 @@ class WatchdogService:
             action = '续接已排队' if ok is True else '续接失败，稍后重试' if ok is False else '投递结果不明确，需人工核查'
             self._update(last_action=action)
             self._log('thread=%s turn=%s outcome=%s' % (tid,turn,state))
+
+    def _dispatch_tasks(self, con, generation):
+        if not self._task_scheduler:
+            return
+        can_submit = lambda: self._active(generation)
+        has_capacity = lambda: self._capacity(con)
+        self._task_scheduler.dispatch_recoveries(can_submit, has_capacity, self._mutex)
+        # Even an old incident in backoff keeps precedence over a brand new task.
+        owned = self._task_scheduler.owned_thread_ids()
+        old_waiting = any(tid not in owned for (tid,) in con.execute(
+            "SELECT thread_id FROM resume_events WHERE state='pending'"))
+        if not old_waiting:
+            self._task_scheduler.dispatch_new(can_submit, has_capacity, self._mutex)
 
     def _cycle(self):
         self._update(last_cycle_at=time.time())
@@ -340,6 +518,11 @@ class WatchdogService:
             generation = self._generation
         con = None
         try:
+            self._read_task_capabilities()
+            tasks = self._refresh_tasks()
+            if tasks:
+                self._scheduler().reconcile()
+                self._refresh_tasks()
             pending = []
             if owner:
                 # sqlite connections are opened and closed exclusively on this worker.
@@ -351,14 +534,29 @@ class WatchdogService:
                 with self._stage('reconcile_pending'):
                     self._reconcile(con)
                     pending = self.core.pending_events(con, self.args)
+                    if self._task_scheduler:
+                        owned = self._task_scheduler.owned_thread_ids()
+                        for item in pending:
+                            if item['thread_id'] in owned:
+                                self.core.set_event(con, item['thread_id'], item['turn_id'], 'queue_owned',
+                                                    '由新任务队列使用原会话 UUID 接续')
+                        pending = [item for item in pending if item['thread_id'] not in owned]
                 self._counts(con)
                 self._heartbeat()
             if not owner:
                 self._read_history()
-            quota = self._read_quota(pending, generation) if self.display_mode or owner else None
+            queued_intent = any(item['status'] in ('pending', 'waiting_quota', 'waiting_resume')
+                                for item in self.snapshot().get('new_tasks', []))
+            quota = self._read_quota(bool(pending) or queued_intent, generation) if self.display_mode or owner else None
+            with self._mutex:
+                self._publish_dispatch_control()
             if owner and self._active(generation):
                 if quota and quota.get('available') is True:
                     self._send(con,pending,generation)
+                    if self._active(generation):
+                        self._dispatch_tasks(con, generation)
+                self._capacity(con)
+                self._refresh_tasks()
                 self._counts(con)
                 if self._active(generation):
                     failed = self.snapshot()['quota_error']
@@ -395,7 +593,21 @@ class WatchdogService:
                         self._log('heartbeat write failed')
                 self._update(phase='idle',phase_started_at=time.time())
                 self._heartbeat()
-                self._wake.wait(self.poll_interval)
+                deadline = time.monotonic() + self.poll_interval
+                while not self._wake.wait(min(.5, max(0, deadline-time.monotonic()))):
+                    if self._shutdown.is_set() or time.monotonic() >= deadline:
+                        break
+                    if self._task_store is not None:
+                        try:
+                            before = {item['id']: item['status'] for item in self.snapshot()['new_tasks']}
+                            tasks = self._refresh_tasks()
+                            # Approval/details reach the HUD promptly. Only a turn
+                            # outcome wakes the existing quota/scheduling cycle.
+                            if any(item['status'] in ('completed', 'failed', 'cancelled', 'waiting_quota')
+                                   and before.get(item['id']) != item['status'] for item in tasks):
+                                break
+                        except Exception as exc:
+                            self._log('queue refresh failed: %s' % exc)
         finally:
             try:
                 self._release()
