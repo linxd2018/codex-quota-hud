@@ -186,6 +186,57 @@ class TaskStore:
             self._event(con, record['id'], 'submitted')
         return record
 
+    def adopt_recovery(self, item):
+        """Atomically hand an unsent incident to the detached turn executor.
+
+        Desktop queued/uncertain messages must never be adopted: they may still
+        execute later. One durable record per original UUID owns all recoveries.
+        """
+        if not os.path.isdir(item['cwd']):
+            raise ValueError('原会话工作目录不存在或无法访问')
+        now = time.time()
+        with self._connection(write=True) as con:
+            event = con.execute('SELECT state FROM resume_events WHERE thread_id=? AND failed_turn_id=?',
+                                (item['thread_id'], item['turn_id'])).fetchone()
+            if not event or event['state'] != 'pending':
+                return None
+            old = self._decode(con.execute('SELECT * FROM new_tasks WHERE thread_id=?',
+                                          (item['thread_id'],)).fetchone())
+            if old and (old['status'] not in ('completed', 'failed', 'cancelled') or
+                        old.get('error_kind') == 'uncertain' or old.get('phase') in UNCERTAIN_PHASES):
+                return None
+            record = dict(id=old['id'] if old else str(uuid.uuid4()),
+                          created_at=old['created_at'] if old else now, updated_at=now,
+                          status='waiting_resume', priority=0, description='自动接续 · ' + (item.get('title') or item['thread_id']),
+                          cwd=item['cwd'], model='', reasoning_effort='', sandbox='', approval_policy='',
+                          thread_id=item['thread_id'], turn_id=item['turn_id'], recovery_turn_id=item['turn_id'],
+                          external_recovery=True, phase='settled', attempts=0, retry_at=0,
+                          started_at=now, completed_at=None, error=None, error_kind=None,
+                          log_path=None, worker_pid=None, worker_token=None,
+                          approval=None, approval_response=None)
+            self._write(con, record)
+            con.execute("UPDATE resume_events SET state='queue_owned',updated_at=?,last_error=? WHERE thread_id=? AND failed_turn_id=?",
+                        (now, '由后台执行器直接启动原会话', item['thread_id'], item['turn_id']))
+            self._event(con, record['id'], 'recovery_adopted', item['turn_id'])
+            return record
+
+    @staticmethod
+    def _recovery_receipt(con, record, changes):
+        if not record.get('external_recovery') or not record.get('recovery_turn_id'):
+            return
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='resume_events'").fetchone():
+            return
+        identity = (record['thread_id'], record['recovery_turn_id'])
+        if changes.get('phase') == 'turn_start_sent':
+            con.execute("UPDATE resume_events SET attempts=attempts+1,last_error=?,updated_at=? WHERE thread_id=? AND failed_turn_id=? AND state='queue_owned' AND last_error!=?",
+                        ('后台正在启动轮次', time.time(), *identity, '后台正在启动轮次'))
+        if changes.get('phase') == 'turn_started' and record.get('turn_id') != record['recovery_turn_id']:
+            con.execute("UPDATE resume_events SET state='confirmed',last_error=NULL,updated_at=? WHERE thread_id=? AND failed_turn_id=? AND state IN ('queue_owned','uncertain')",
+                        (time.time(), *identity))
+        elif changes.get('error_kind') == 'uncertain':
+            con.execute("UPDATE resume_events SET state='uncertain',last_error=?,updated_at=? WHERE thread_id=? AND failed_turn_id=? AND state='queue_owned'",
+                        (record.get('error'), time.time(), *identity))
+
     def update(self, task_id, changes, expected_status=None, expected_fields=None):
         if any(key in changes for key in ('id', 'created_at')):
             raise ValueError('任务标识和创建时间不可修改')
@@ -199,6 +250,7 @@ class TaskStore:
             previous = record['status']
             record.update(changes, updated_at=time.time())
             self._write(con, record)
+            self._recovery_receipt(con, record, changes)
             if record['status'] != previous:
                 self._event(con, task_id, 'state', {'from':previous, 'to':record['status'],
                                                    'error':record.get('error')})
@@ -225,7 +277,9 @@ class TaskStore:
         # Retain an audit tombstone: removing from dispatch must not erase intent.
         with self._connection(write=True) as con:
             record = self._require(con, task_id)
-            self._editable(record)
+            if not (record['status'] == 'failed' and record.get('phase') == 'settled'
+                    and not record.get('worker_pid') and record.get('error_kind') != 'uncertain'):
+                self._editable(record)
             record.update(status='cancelled', completed_at=time.time(), updated_at=time.time())
             self._write(con, record)
             self._event(con, task_id, 'cancelled')
@@ -252,7 +306,8 @@ class TaskStore:
                 raise ValueError('任务进程尚未退出，请先处理当前请求')
             if record.get('error_kind') == 'uncertain' or record.get('phase') in UNCERTAIN_PHASES:
                 raise ValueError('上次启动结果不明确，请先核对会话；为避免重复启动，不能直接重试')
-            validate_spec(record)
+            if not record.get('external_recovery'):
+                validate_spec(record)
             record.update(status='waiting_resume' if record.get('thread_id') else 'pending',
                           updated_at=time.time(), retry_at=0, error=None, error_kind=None,
                           completed_at=None, approval=None, approval_response=None,

@@ -15,8 +15,8 @@ from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, QVariantAnimation, QEasi
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QLinearGradient, QPen, QFont, QIcon, QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QFrame, QToolButton, QAbstractButton, QSizePolicy, QDialog, QFormLayout,
-    QLineEdit, QPushButton, QFileDialog, QMessageBox, QCheckBox, QTableWidget,
-    QTableWidgetItem, QHeaderView, QTextEdit, QSlider, QScrollArea, QLayout)
+    QLineEdit, QPushButton, QFileDialog, QMessageBox, QCheckBox, QTreeWidget,
+    QTreeWidgetItem, QHeaderView, QTextEdit, QSlider, QScrollArea, QLayout)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from quota_hud import remaining, percent, countdown, freshness, read_json, discover_runtime, DemoService, log_error, clamp_position
@@ -24,7 +24,7 @@ from hud_controls import ClickthroughControl, window_title, health_label
 from windows_hud_shell import WindowsHUDShell
 from windows_hud_effects import WindowEffects
 import follow_gpt
-from task_queue_ui import (TaskComposer, TaskQueueDialog, ConcurrentSpinBox,
+from task_queue_ui import (TaskComposer, TaskQueueDialog, ConcurrentSpinBox, STATUS_NAMES,
                            normalized_max_concurrent_tasks)
 
 GREEN, RED, BLUE = '#30B66C', '#E45D69', '#007AFF'
@@ -318,6 +318,8 @@ class GlassHUD(QWidget):
         self.timer.timeout.connect(self._poll)
         self.timer.start()
         if configured:
+            if not self.demo and self.preferences.get('automation_enabled') is True:
+                self.service.set_enabled(True)
             self.service.start()
         else:
             QTimer.singleShot(300, self.settings)
@@ -389,7 +391,7 @@ class GlassHUD(QWidget):
         self.status_label = label('自动接续已关闭', 9, bold=True)
         health.addWidget(self.health_dot)
         health.addWidget(self.status_label, 1)
-        self.records_button = self._tool('records', '查看恢复记录  Ctrl+L', self.records, 28)
+        self.records_button = self._tool('records', '查看任务历史  Ctrl+L', self.records, 28)
         health.addWidget(self.records_button)
         health_group.addLayout(health)
         self.count_label = label('待续 0   投递 0   确认 0', 8, MUTED)
@@ -577,7 +579,7 @@ class GlassHUD(QWidget):
 
     def _save_preferences(self):
         if self.demo:
-            return
+            return True
         self.preferences.update(x=self.x(), y=self.y(), pinned=self.pinned, glass=self.glass,
                                 transparency=self.transparency)
         try:
@@ -586,8 +588,10 @@ class GlassHUD(QWidget):
             with open(temporary, 'w', encoding='utf-8') as stream:
                 json.dump(self.preferences, stream, ensure_ascii=False, indent=2)
             os.replace(temporary, self.settings_path)
+            return True
         except OSError as exc:
             log_error('HUD preferences: ' + str(exc))
+            return False
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -679,6 +683,8 @@ class GlassHUD(QWidget):
             self.settings()
             return
         self.service.set_enabled(not self.service.snapshot().get('enabled', False))
+        self.preferences['automation_enabled'] = self.service.snapshot().get('enabled', False)
+        self._save_preferences()
         self._reflect_controls()
 
     def toggle_clickthrough(self, checked=None):
@@ -814,63 +820,129 @@ class GlassHUD(QWidget):
             self._populate_records()
             return
         dialog = self.records_dialog = QDialog(self)
-        dialog.setWindowTitle('任务恢复记录')
+        dialog.setWindowTitle('任务历史')
         dialog.resize(720, 390)
         self._dialog_style(dialog)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(22, 20, 22, 20)
-        layout.addWidget(label('任务恢复记录', 15, bold=True))
-        layout.addWidget(label('“已投递”表示命令已接受；“已确认”表示找到了本次续接消息及后续轮次。', 9, MUTED))
-        self.records_table = QTableWidget(0, 4)
-        self.records_table.setHorizontalHeaderLabels(['任务', '状态', '尝试', '更新时间'])
-        self.records_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.records_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.records_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.records_table.verticalHeader().hide()
-        self.records_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.records_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.records_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.records_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.records_table.itemSelectionChanged.connect(self._record_detail)
-        layout.addWidget(self.records_table, 1)
+        layout.addWidget(label('任务历史', 15, bold=True))
+        self.records_tree = QTreeWidget()
+        self.records_tree.setExpandsOnDoubleClick(False)
+        self.records_tree.setHeaderLabels(['会话 / 记录', '状态', '更新时间', '来源'])
+        self.records_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in range(1, 4):
+            self.records_tree.header().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.records_tree.currentItemChanged.connect(self._record_detail)
+        self.records_tree.itemClicked.connect(self._toggle_history_group)
+        layout.addWidget(self.records_tree, 1)
         self.record_info = QTextEdit()
         self.record_info.setReadOnly(True)
         self.record_info.setMaximumHeight(90)
         layout.addWidget(self.record_info)
+        self.history_delete = QPushButton('删除所选历史')
+        self.history_delete.clicked.connect(self._delete_history)
+        layout.addWidget(self.history_delete)
         self._records_signature = None
         self._populate_records()
         dialog.show()
 
     def _populate_records(self):
-        events = self.last.get('recent_events') or []
-        signature = repr(events)
+        events = [dict(event, source='接续记录') for event in self.last.get('recent_events') or []]
+        events.extend(dict(task, title=task.get('description'), state=task['status'],
+                           source='队列任务', updated_at=task.get('completed_at') or task.get('updated_at'))
+                      for task in self.last.get('new_tasks') or []
+                      if task.get('status') in ('completed', 'cancelled'))
+        hidden = set(self.preferences.get('hidden_history_records') or [])
+        groups = {}
+        for event in sorted(events, key=lambda event: event.get('updated_at') or 0, reverse=True):
+            thread = event.get('thread_id')
+            if event['source'] == '队列任务':
+                key = json.dumps(['queue', event['id'], event.get('completed_at')])
+            else:
+                key = json.dumps(['resume', thread, event.get('turn_id')])
+            if key not in hidden:
+                event['history_key'] = key
+                groups.setdefault(('thread:' + thread) if thread else key, []).append(event)
+        signature = repr(groups)
         if signature == self._records_signature:
             return
         self._records_signature = signature
-        self._record_rows = events
-        self.records_table.setRowCount(len(events))
-        for i, event in enumerate(events):
-            try:
-                stamp = dt.datetime.fromtimestamp(float(event.get('updated_at', 0))).strftime('%m/%d %H:%M')
-            except (TypeError, ValueError, OSError):
-                stamp = '未知'
-            for j, text in enumerate([event.get('title') or event.get('thread_id', '')[:12], STATE_NAMES.get(event.get('state'), event.get('state', '未知')), str(event.get('attempts', 0)), stamp]):
-                self.records_table.setItem(i, j, QTableWidgetItem(text))
-        if not events:
-            self.record_info.setPlainText('还没有恢复记录。开启自动接续后，仅处理明确因额度中断的原任务。')
-        else:
-            self.records_table.selectRow(0)
+        tree = self.records_tree
+        role = Qt.ItemDataRole.UserRole
+        selected = tree.currentItem()
+        selected_key = selected.data(0, role)[0] if selected else None
+        expanded = {tree.topLevelItem(i).data(0, role)[0] for i in range(tree.topLevelItemCount())
+                    if tree.topLevelItem(i).isExpanded()}
+        with QSignalBlocker(tree):
+            tree.clear()
+            for group, records in groups.items():
+                first = records[0]
+                title = first.get('title') or first.get('thread_id') or '未启动的任务'
+                parent = QTreeWidgetItem(tree, [title.splitlines()[0], '%s 条记录' % len(records),
+                                                self._history_stamp(first), '会话'])
+                parent.setData(0, role, (group, records))
+                parent.setExpanded(group in expanded)
+                if group == selected_key:
+                    tree.setCurrentItem(parent)
+                for record in records:
+                    labels = STATUS_NAMES if record['source'] == '队列任务' else STATE_NAMES
+                    state = labels.get(record.get('state'), record.get('state', '未知'))
+                    child = QTreeWidgetItem(parent, [record.get('title') or title, state,
+                                                    self._history_stamp(record), record['source']])
+                    child.setData(0, role, (record['history_key'], [record]))
+                    if record['history_key'] == selected_key:
+                        tree.setCurrentItem(child)
+        self._record_detail(tree.currentItem())
 
-    def _record_detail(self):
-        row = self.records_table.currentRow()
-        if row < 0 or row >= len(getattr(self, '_record_rows', [])):
+    @staticmethod
+    def _history_stamp(record):
+        try:
+            return dt.datetime.fromtimestamp(float(record.get('updated_at', 0))).strftime('%m/%d %H:%M')
+        except (TypeError, ValueError, OSError, OverflowError):
+            return '未知'
+
+    @staticmethod
+    def _toggle_history_group(item, column):
+        if item.parent() is None and column == 0:
+            item.setExpanded(not item.isExpanded())
+
+    def _record_detail(self, item, previous=None):
+        self.history_delete.setEnabled(item is not None)
+        if item is None:
+            self.record_info.setPlainText('选择会话展开记录。' if self.records_tree.topLevelItemCount() else '还没有任务历史。')
             return
-        item = self._record_rows[row]
-        self.record_info.setPlainText('会话：%s\n原因：%s' % (item.get('thread_id', ''), item.get('error') or STATE_NAMES.get(item.get('state'), '暂无额外说明')))
+        _, records = item.data(0, Qt.ItemDataRole.UserRole)
+        record = records[0]
+        if item.parent() is None:
+            self.record_info.setPlainText('此会话共 %s 条历史。点击会话名称展开。' % len(records))
+        else:
+            self.record_info.setPlainText('%s\n会话：%s\n%s' % (
+                record.get('title') or '', record.get('thread_id') or '未启动',
+                record.get('error') or item.text(1)))
+
+    def _delete_history(self):
+        item = self.records_tree.currentItem()
+        if item is None:
+            return
+        _, records = item.data(0, Qt.ItemDataRole.UserRole)
+        if item.parent() is None and len(records) > 1:
+            if QMessageBox.question(self.records_dialog, '删除会话历史',
+                                    '从任务历史中删除此会话的 %s 条记录？' % len(records),
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+        previous = self.preferences.get('hidden_history_records') or []
+        self.preferences['hidden_history_records'] = sorted(set(previous) | {
+            record['history_key'] for record in records})
+        if not self._save_preferences():
+            self.preferences['hidden_history_records'] = previous
+            QMessageBox.warning(self.records_dialog, '删除未完成', '无法保存任务历史设置。')
+            return
+        self._populate_records()
 
     @staticmethod
     def _dialog_style(dialog):
-        dialog.setStyleSheet('QDialog{background:#F3F6FB;color:#17243A;} QLabel{background:transparent;} QLineEdit,QTextEdit,QTableWidget{background:white;color:#17243A;border:1px solid #DCE3EE;border-radius:8px;padding:6px;} QPushButton{background:#3478F6;color:white;border:none;border-radius:9px;padding:8px 14px;} QPushButton:hover{background:#2867DF;} QHeaderView::section{background:#EAF0F9;color:#66768B;border:0;padding:7px;} QSlider::groove:horizontal{height:4px;background:#DCE4F0;border-radius:2px;} QSlider::sub-page:horizontal{background:#3478F6;border-radius:2px;} QSlider::handle:horizontal{background:white;border:1px solid #3478F6;width:16px;margin:-6px 0;border-radius:8px;}')
+        dialog.setStyleSheet('QDialog{background:#F3F6FB;color:#17243A;} QLabel{background:transparent;} QLineEdit,QTextEdit,QTableWidget,QTreeWidget{background:white;color:#17243A;border:1px solid #DCE3EE;border-radius:8px;padding:6px;} QPushButton{background:#3478F6;color:white;border:none;border-radius:9px;padding:8px 14px;} QPushButton:hover{background:#2867DF;} QPushButton:disabled{background:#E4EAF3;color:#63748B;} QHeaderView::section{background:#EAF0F9;color:#66768B;border:0;padding:7px;} QSlider::groove:horizontal{height:4px;background:#DCE4F0;border-radius:2px;} QSlider::sub-page:horizontal{background:#3478F6;border-radius:2px;} QSlider::handle:horizontal{background:white;border:1px solid #3478F6;width:16px;margin:-6px 0;border-radius:8px;}')
 
     def settings(self):
         self._restore_for_dialog()

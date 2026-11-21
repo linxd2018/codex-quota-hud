@@ -64,6 +64,7 @@ class ClickthroughTests(unittest.TestCase):
         self.assertIn('已关闭', health_label({'service_alive': True, 'enabled': False}))
 
     def test_actual_window_duration_labels(self):
+        self.assertIn('1 个待续', health_label({'enabled': False, 'pending_count': 1}))
         self.assertEqual(window_title({'window_minutes': 300}, 'primary'), '5 小时窗口')
         self.assertEqual(window_title({'window_minutes': 15}, 'primary'), '15 分钟窗口')
         self.assertEqual(window_title({'secondary_window_minutes': 10080}, 'secondary'), '7 天窗口')

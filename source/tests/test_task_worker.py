@@ -119,6 +119,30 @@ class WorkerTests(unittest.TestCase):
         turn = next(p for m,p in server.calls if m == 'turn/start')
         self.assertIn(core.resume_marker({'thread_id':'real-thread','turn_id':'failed-turn'}), turn['input'][0]['text'])
 
+    def test_external_recovery_starts_original_thread_without_desktop_queue_or_overrides(self):
+        self.store.update(self.task['id'], dict(thread_id='real-thread', turn_id='failed-turn',
+                          phase='resume_claimed', external_recovery=True))
+        task, server = self.run_worker()
+        self.assertEqual(task['status'], 'completed')
+        self.assertEqual([m for m,p in server.calls], ['thread/resume', 'turn/start'])
+        resume = server.calls[0][1]
+        self.assertEqual(resume, {'threadId': 'real-thread', 'excludeTurns': True})
+        turn = server.calls[1][1]
+        self.assertEqual(turn['threadId'], 'real-thread')
+        for key in ('model', 'effort', 'approvalPolicy', 'sandboxPolicy', 'cwd'):
+            self.assertNotIn(key, turn)
+        self.assertEqual(task['turn_id'], 'real-turn')
+
+    def test_external_recovery_waits_when_desktop_owns_writer(self):
+        self.store.update(self.task['id'], dict(thread_id='real-thread', turn_id='failed-turn',
+                          phase='resume_claimed', external_recovery=True))
+        task, server = self.run_worker(fail={'thread/resume': RpcError({
+            'code': -32600, 'message': 'thread real-thread already has an active writer'})})
+        self.assertEqual(task['status'], 'waiting_resume')
+        self.assertEqual(task['error_kind'], 'session_busy')
+        self.assertGreater(task['retry_at'], 0)
+        self.assertEqual([m for m, p in server.calls], ['thread/resume'])
+
     def test_user_cancelled_turn_does_not_auto_resume(self):
         task, server = self.run_worker([completion('interrupted')])
         self.assertEqual(task['status'], 'cancelled')

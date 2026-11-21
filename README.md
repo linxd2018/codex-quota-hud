@@ -5,7 +5,7 @@ and opt-in recovery for Codex conversations interrupted by quota limits.
 
 Windows Codex 额度悬浮窗：查看剩余额度与重置时间，并可手动开启额度恢复后的任务接续。
 
-**Current version: 1.1.3.** Softer glass borders, improved text contrast, aligned glass layers, and a matching blue tray icon.
+**Current version: 1.2.5.** Task history groups queue and continuation records by conversation. Expand a conversation to inspect individual records, or remove older entries from the list.
 
 ![Offline demonstration](docs/preview.png)
 
@@ -14,10 +14,11 @@ Windows Codex 额度悬浮窗：查看剩余额度与重置时间，并可手动
 - Primary and weekly quota windows, reset countdowns and stale-data indicators.
 - Native Windows Composition blur, adjustable transparency and readable fallback.
 - Tray, pinning, keyboard shortcuts, optional mouse passthrough and startup companion.
-- Automatic continuation is **off at startup** and must be enabled explicitly.
+- Automatic continuation is off on first launch and remembers your explicit choice.
 - Local SQLite delivery tracking distinguishes queued, confirmed and uncertain results.
 - A persistent task queue accepts new work even when quota is exhausted. It starts new
   Codex conversations after quota recovers and prioritizes interrupted conversations.
+- Interrupted conversations can resume in a background worker without opening their desktop tab.
 - Settings lets you change the shared concurrency limit from 3 to 10. Lowering the
   limit leaves existing turns running.
 
@@ -62,8 +63,8 @@ cd ..
 ```
 
 The executable is `release/CodexQuotaHUD/CodexQuotaHUD.exe`.
-The root `启动额度HUD.vbs` launcher uses that path. Distribute the entire
-application directory, not only the EXE. The native DLL is rebuilt locally,
+You can create a Windows shortcut to the executable. Distribute the entire
+application directory, including its runtime files. The native DLL is rebuilt locally,
 not supplied as an opaque binary in this source repository.
 
 ## Shortcuts
@@ -72,7 +73,7 @@ not supplied as an opaque binary in this source repository.
 |---|---|
 | Ctrl+R | Refresh quota |
 | Ctrl+, | Settings |
-| Ctrl+L | Recovery history |
+| Ctrl+L | Task history |
 | Ctrl+Alt+H | Hide / show HUD |
 | Ctrl+Alt+P | Toggle mouse passthrough |
 

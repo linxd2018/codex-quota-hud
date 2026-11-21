@@ -92,15 +92,78 @@ class RuntimeTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.core = FakeCore(self.tmp.name)
         self.service = WatchdogService(core=self.core, poll_interval=30)
+        self.core.execution_snapshot = lambda: {'active_thread_ids': set(), 'turns': copy.deepcopy(self.core.turns)}
+        self.fake_workers = {}
+        self.service._scheduler().launcher = self.launch_fake_worker
+        self.service._scheduler().worker_alive = lambda task: bool(self.fake_workers.get(task['id']) and self.fake_workers[task['id']].is_alive())
+
+    def launch_fake_worker(self, task, path, core):
+        thread = threading.Thread(target=self.execute_fake_worker, args=(task, path, core), daemon=True)
+        self.fake_workers[task['id']] = thread
+        thread.start()
+
+    def execute_fake_worker(self, task, path, core):
+        from task_scheduler import worker_dispatch_allowed
+        store = self.service._tasks()
+        allowed = lambda: self.service._active() and worker_dispatch_allowed(task, store, core)[0]
+        item = dict(thread_id=task['thread_id'], turn_id=task['turn_id'], cwd=task['cwd'])
+        try:
+            if not allowed():
+                ok, detail = False, 'permit revoked'
+            elif hasattr(core, 'queue_resume_guarded'):
+                ok, detail = core.queue_resume_guarded(item, allowed)
+            else:
+                ok, detail = core.queue_resume(item)
+        except Exception as exc:
+            store.update(task['id'], dict(status='failed', phase='uncertain', error_kind='uncertain', error=str(exc)))
+            return
+        if ok:
+            store.update(task['id'], dict(status='running', phase='turn_started', turn_id='continued-' + task['turn_id']))
+            store.update(task['id'], dict(status='completed', phase='settled'))
+        else:
+            store.update(task['id'], dict(status='waiting_resume', phase='permit_revoked', error=detail, retry_at=time.time()+5))
     def tearDown(self):
         self.service.stop()
+        for thread in self.fake_workers.values():
+            thread.join(1)
         self.tmp.cleanup()
     def incident(self, turn='first'):
-        self.core.items = [{'thread_id':'thread','turn_id':turn,'title':'test','cwd':''}]
+        self.core.items = [{'thread_id':'thread','turn_id':turn,'title':'test','cwd':self.tmp.name}]
         self.core.turns['thread']['turn_id'] = turn
     def start_enabled(self):
         self.service.start()
         self.service.set_enabled(True)
+    def test_delayed_failure_after_enable_is_discovered_without_refresh(self):
+        self.core.quota = {'available': False, 'used': 100}
+        scanned = threading.Event()
+        discover = self.core.discover_events
+        def discover_delayed(con, args):
+            before = con.total_changes
+            discover(con, args)
+            scanned.set()
+            return [True] if con.total_changes > before else []
+        self.core.discover_events = discover_delayed
+        self.start_enabled()
+        self.assertTrue(scanned.wait(1))
+        wait_for(lambda: self.core.reads > 0 and not self.service.snapshot()['refreshing'])
+        reads = self.core.reads
+        # The history mirror records failure after the enable-triggered scan.
+        self.incident()
+        wait_for(lambda: self.service.snapshot()['pending_count'] == 1)
+        self.assertEqual(self.core.sent, [])
+        self.assertEqual(self.core.pings, 0)
+        self.assertEqual(self.core.reads, reads)
+
+    def test_local_incident_poll_requires_enabled_lock_owner(self):
+        self.incident()
+        self.service._poll_incidents()
+        self.assertFalse(os.path.exists(self.core.STATE_DB))
+        self.service.set_enabled(True)
+        self.service._poll_incidents()
+        self.assertFalse(os.path.exists(self.core.STATE_DB))
+        self.service.set_enabled(False)
+        self.assertEqual(self.core.sent, [])
+
     def test_two_distinct_failure_cycles(self):
         self.incident()
         self.start_enabled()
@@ -338,7 +401,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.core.sent,[])
         con=self.core.state_connection()
         try:
-            self.assertEqual(con.execute('SELECT state FROM resume_events').fetchone()[0],'pending')
+            self.assertEqual(con.execute('SELECT state FROM resume_events').fetchone()[0],'queue_owned')
         finally:
             con.close()
 

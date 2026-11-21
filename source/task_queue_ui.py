@@ -324,7 +324,7 @@ class TaskQueueDialog(QDialog):
         row = QHBoxLayout()
         self.edit_button = QPushButton('修改')
         self.edit_button.clicked.connect(self._edit)
-        self.delete_button = QPushButton('删除待启动项')
+        self.delete_button = QPushButton('移出队列')
         self.delete_button.clicked.connect(lambda: self._action('queue_delete'))
         self.retry_button = QPushButton('重试 / 继续')
         self.retry_button.clicked.connect(lambda: self._action('queue_retry'))
@@ -361,7 +361,8 @@ class TaskQueueDialog(QDialog):
         return self.rows[row] if 0 <= row < len(self.rows) else None
 
     def refresh(self, snapshot):
-        rows = snapshot.get('new_tasks') or []
+        rows = [task for task in snapshot.get('new_tasks') or []
+                if task.get('status') not in ('completed', 'cancelled')]
         error = snapshot.get('capacity_error')
         self.summary.setText('运行 %s  ·  已保留名额 %s  ·  上限 %s%s' % (
             snapshot.get('running_task_count', 0), snapshot.get('reserved_task_count', 0),
@@ -391,7 +392,10 @@ class TaskQueueDialog(QDialog):
         task = self.selected() or {}
         editable = bool(task and task.get('started_at') is None and not task.get('thread_id') and task.get('status') in EDITABLE)
         self.edit_button.setEnabled(editable)
-        self.delete_button.setEnabled(editable)
+        self.edit_button.setToolTip('已启动的任务沿用原会话，不能修改' if task and not editable else '')
+        self.delete_button.setEnabled(editable or (task.get('status') == 'failed'
+            and task.get('phase') == 'settled' and not task.get('worker_pid')
+            and task.get('error_kind') != 'uncertain'))
         can_prioritize = task.get('status') in ('pending', 'waiting_quota', 'waiting_resume', 'failed')
         self.priority_button.setEnabled(can_prioritize)
         self.priority.setEnabled(can_prioritize)
@@ -432,7 +436,10 @@ class TaskQueueDialog(QDialog):
             if method == 'queue_respond_approval':
                 args = (task.get('approval'), *args)
             getattr(self.service, method)(task['id'], *args)
-            self.feedback.setText('已保存。')
+            self.feedback.setText({
+                'queue_retry': '已重新排队，等待调度。',
+                'queue_delete': '已移出队列，可在任务历史查看。',
+            }.get(method, '已保存。'))
             self.refresh(self.service.snapshot())
         except Exception as exc:
             self.feedback.setText('操作未完成：' + str(exc))

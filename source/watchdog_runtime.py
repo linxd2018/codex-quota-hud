@@ -466,34 +466,22 @@ class WatchdogService:
                 continue
             if current.get('status') != 'failed' or not self.core.quota_error(current.get('error')):
                 continue
-            # Serialize the final permission check and commit of sending intent.
-            # Once committed, this call is in flight; disabling still prevents the next item.
+            # Hand off only unsent incidents. The worker starts a real turn via
+            # app-server, with a fresh enable/capacity check before the RPC.
             with self._mutex:
                 if not self._active(generation):
                     return
                 if not self._capacity(con):
                     return
-                self.core.set_event(con,tid,turn,'sending')
-                self._update(monitor_state='sending',status='正在投递原会话续接')
-            self._heartbeat()
-            if not self._active(generation):
-                # Sending intent was persisted but no queue call began.
-                self.core.set_event(con,tid,turn,'pending','自动接续已关闭，未投递')
-                return
-            try:
-                with self._stage('queue_resume'):
-                    guarded = getattr(self.core, 'queue_resume_guarded', None)
-                    if guarded:
-                        ok, detail = guarded(item, lambda: self._active(generation) and self._capacity(con, tid))
-                    else:
-                        ok, detail = self.core.queue_resume(item)
-            except Exception as exc:
-                ok, detail = None, '投递异常，结果不明确: %s' % type(exc).__name__
-            state = 'queued' if ok is True else 'pending' if ok is False else 'uncertain'
-            self.core.set_event(con,tid,turn,state,detail,attempt_delta=1)
-            action = '续接已排队' if ok is True else '续接失败，稍后重试' if ok is False else '投递结果不明确，需人工核查'
-            self._update(last_action=action)
-            self._log('thread=%s turn=%s outcome=%s' % (tid,turn,state))
+                try:
+                    task = self._tasks().adopt_recovery(item)
+                except ValueError as exc:
+                    self.core.set_event(con, tid, turn, 'pending', self._safe(exc), attempt_delta=1)
+                    continue
+                if task:
+                    self._scheduler()
+                    self._update(last_action='原会话已交给后台执行器')
+                    self._log('thread=%s turn=%s outcome=background_owned task=%s' % (tid,turn,task['id']))
 
     def _dispatch_tasks(self, con, generation):
         if not self._task_scheduler:
@@ -507,6 +495,28 @@ class WatchdogService:
             "SELECT thread_id FROM resume_events WHERE state='pending'"))
         if not old_waiting:
             self._task_scheduler.dispatch_new(can_submit, has_capacity, self._mutex)
+
+    def _poll_incidents(self):
+        # The history mirror can lag behind the enable-triggered scan. Discover
+        # local failures promptly without increasing network quota polling.
+        if not self._active() or not self._instance:
+            return
+        con = self.core.state_connection()
+        try:
+            if not self.core.discover_events(con, self.args):
+                return
+            self._reconcile(con)
+            self._counts(con)
+            snap = self.snapshot()
+            if self._active() and snap['pending_count']:
+                if (snap.get('quota') or {}).get('available') is False:
+                    self._update(monitor_state='waiting', status='等待额度恢复')
+                else:
+                    # Confirm quota in the normal cycle before any dispatch.
+                    self._wake.set()
+            self._heartbeat()
+        finally:
+            con.close()
 
     def _cycle(self):
         self._update(last_cycle_at=time.time())
@@ -594,9 +604,16 @@ class WatchdogService:
                 self._update(phase='idle',phase_started_at=time.time())
                 self._heartbeat()
                 deadline = time.monotonic() + self.poll_interval
+                next_history_poll = time.monotonic() + 1
                 while not self._wake.wait(min(.5, max(0, deadline-time.monotonic()))):
                     if self._shutdown.is_set() or time.monotonic() >= deadline:
                         break
+                    if time.monotonic() >= next_history_poll:
+                        try:
+                            self._poll_incidents()
+                        except Exception as exc:
+                            self._log('incident refresh failed: %s' % exc)
+                        next_history_poll = time.monotonic() + 1
                     if self._task_store is not None:
                         try:
                             before = {item['id']: item['status'] for item in self.snapshot()['new_tasks']}

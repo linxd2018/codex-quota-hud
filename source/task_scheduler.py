@@ -70,6 +70,7 @@ def worker_dispatch_allowed(task, store, core, stage='turn'):
         current.update(phase='thread_start_sent' if stage == 'thread' else 'turn_start_sent',
                        updated_at=time.time())
         store._write(con, current)
+        store._recovery_receipt(con, current, {'phase': current['phase']})
         return True, ''
 
 
@@ -228,6 +229,7 @@ class TaskScheduler:
                     return
                 claimed = self.store.update(task['id'], dict(status='starting', phase='resume_claimed',
                     worker_pid=None, worker_token=str(uuid.uuid4()), attempts=task.get('attempts', 0)+1,
+                    **({'recovery_turn_id': task['turn_id']} if task.get('external_recovery') else {}),
                     started_at=task.get('started_at') or time.time(), error=None, error_kind=None),
                     expected_status=task['status'])
                 if claimed is None:

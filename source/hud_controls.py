@@ -54,6 +54,8 @@ def health_label(snapshot):
     if state == 'blocked':
         return '另一看门狗正在运行'
     if not snapshot.get('enabled'):
+        if snapshot.get('pending_count'):
+            return '自动接续已关闭 · %s 个待续任务暂停中' % snapshot['pending_count']
         return '自动接续已关闭'
     if state == 'waiting':
         return '等待额度恢复'

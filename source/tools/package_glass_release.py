@@ -8,7 +8,7 @@ import zipfile
 
 
 def source_files(root):
-    paths = [root/n for n in ['README.md','LICENSE','SECURITY.md','DESIGN.md','启动额度HUD.vbs','.gitignore','.gitattributes']]
+    paths = [root/n for n in ['README.md','LICENSE','SECURITY.md','DESIGN.md','.gitignore','.gitattributes']]
     paths += [p for p in (root/'docs').rglob('*') if p.is_file()]
     for pattern in ['*.py','*.txt','*.spec','*.bat','VERSION']:
         paths += list((root/'source').glob(pattern))

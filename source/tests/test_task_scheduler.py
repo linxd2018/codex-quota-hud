@@ -62,6 +62,12 @@ class CapacityTests(unittest.TestCase):
         self.core.execution_snapshot = lambda: {'active_thread_ids': set(self.active), 'unknown_thread_ids': set()}
         self.active = set()
         self.service = WatchdogService(core=self.core)
+        def launch(task, path, core):
+            core.sent.append(task['turn_id'])
+            self.service._tasks().update(task['id'], dict(status='running', phase='turn_started',
+                                         turn_id='started-' + task['turn_id']))
+        self.service._scheduler().launcher = launch
+        self.service._scheduler().worker_alive = lambda task: True
         self.service.set_enabled(True)
         self.addCleanup(self.service.stop)
 
@@ -72,7 +78,7 @@ class CapacityTests(unittest.TestCase):
             tid = 'task-%s' % i
             con.execute('INSERT INTO threads VALUES(?,0,NULL,?)', (tid, 'cli'))
             self.core.turns[tid] = {'turn_id': tid, 'status': 'failed', 'error': '{"type":"usageLimitExceeded"}'}
-            self.core.items.append(dict(thread_id=tid, turn_id=tid, title=tid, cwd=''))
+            self.core.items.append(dict(thread_id=tid, turn_id=tid, title=tid, cwd=self.tmp.name))
         con.commit()
         con.close()
 
@@ -107,15 +113,18 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(self.core.sent, [])
         self.assertIn('history unavailable', self.service.snapshot()['capacity_error'])
 
-    def test_legacy_final_preflight_rechecks_lowered_limit(self):
+    def test_background_final_preflight_rechecks_lowered_limit(self):
         self.pending(1)
         self.active = {'a', 'b'}
         self.service.set_max_concurrent_tasks(4)
-        def guarded(item, can_submit):
+        def guarded(task, path, core):
+            from task_scheduler import worker_dispatch_allowed
             self.active.add('manual-started-during-preflight')
             self.service.set_max_concurrent_tasks(3)
-            return self.core.queue_resume(item) if can_submit() else (False, 'capacity changed')
-        self.core.queue_resume_guarded = guarded
+            allowed, reason = worker_dispatch_allowed(task, self.service._tasks(), core)
+            self.assertFalse(allowed)
+            self.assertIn('最大并发', reason)
+        self.service._scheduler().launcher = guarded
         self.service._cycle()
         self.assertEqual(self.core.sent, [])
 
@@ -301,15 +310,16 @@ class QueueSchedulingTests(unittest.TestCase):
         self.service._cycle()
         self.assertEqual(len(self.started), 3)
 
-    def test_owned_failed_record_still_releases_to_legacy_recovery_after_manual_turn(self):
+    def test_owned_failed_record_recovers_in_background_after_manual_turn(self):
         # A terminal task record must not permanently suppress later client turns.
         self.configure()
         task = self.submit()
         self.store.update(task['id'], dict(status='failed',phase='settled', thread_id='thread'))
-        self.core.items = [dict(thread_id='thread',turn_id='first',title='continued manually',cwd='')]
+        self.core.items = [dict(thread_id='thread',turn_id='first',title='continued manually',cwd=self.tmp.name)]
         self.service.set_enabled(True)
         self.service._cycle()
-        self.assertEqual(self.core.sent, ['first'])
+        self.assertEqual(self.started, [task['id']])
+        self.assertEqual(self.core.sent, [])
 
     def test_manual_completion_while_waiting_quota_prevents_auto_resume(self):
         self.configure()

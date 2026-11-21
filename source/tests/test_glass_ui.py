@@ -239,6 +239,48 @@ class GlassUITests(unittest.TestCase):
         self.assertEqual(self.hud.auto_state.text(), '开')
         self.assertIn('#30B66C', self.hud.auto_state.styleSheet())
 
+    def test_explicit_automation_choice_survives_restart_and_close(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            self.hud.demo = False
+            self.hud.settings_path = os.path.join(directory, 'hud-settings.json')
+            self.hud.toggle_automation()
+            saved = json.loads(Path(self.hud.settings_path).read_text(encoding='utf-8'))
+            self.assertIs(saved.get('automation_enabled'), True)
+            self.hud.close()
+            saved = json.loads(Path(self.hud.settings_path).read_text(encoding='utf-8'))
+            self.assertIs(saved.get('automation_enabled'), True)
+            service = DemoService()
+            hud = GlassHUD(service, core=SimpleNamespace(CONFIG_FILE=os.path.join(directory, 'config.json')),
+                           shell=FakeShell(), effects_factory=FakeEffects)
+            try:
+                self.assertTrue(service.snapshot()['enabled'])
+                self.assertTrue(hud.auto_switch.isChecked())
+                hud.toggle_automation()
+                saved = json.loads(Path(hud.settings_path).read_text(encoding='utf-8'))
+                self.assertIs(saved.get('automation_enabled'), False)
+            finally:
+                hud.close()
+            service = DemoService()
+            hud = GlassHUD(service, core=SimpleNamespace(CONFIG_FILE=os.path.join(directory, 'config.json')),
+                           shell=FakeShell(), effects_factory=FakeEffects)
+            try:
+                self.assertFalse(service.snapshot()['enabled'])
+            finally:
+                hud.close()
+
+    def test_saved_automation_requires_explicit_boolean_opt_in(self):
+        for preference in ({}, {'automation_enabled': 'true'}, {'automation_enabled': False}):
+            with self.subTest(preference=preference), patch('quota_glass.read_json', return_value=preference):
+                service = DemoService()
+                hud = GlassHUD(service, shell=FakeShell(), effects_factory=FakeEffects)
+                try:
+                    self.assertFalse(service.snapshot()['enabled'])
+                finally:
+                    hud.demo = True  # Never write real preferences from this test.
+                    hud.close()
+
+
     def test_show_and_settings_restore_interaction_without_stopping_service(self):
         self.hud.toggle_automation()
         self.hud._set_clickthrough(True)
@@ -289,10 +331,27 @@ class GlassUITests(unittest.TestCase):
 
     def test_records_keep_literal_task_text_and_do_not_send(self):
         self.hud.last['recent_events'] = [dict(title='<script>example</script>', thread_id='demo',
-            state='confirmed', updated_at=100, attempts=1, error='已确认本次续接')]
+            turn_id=turn, state='confirmed', updated_at=100, attempts=1, error='已确认本次续接')
+            for turn in ('first', 'second')]
         self.hud.records()
-        self.assertEqual(self.hud.records_table.item(0, 0).text(), '<script>example</script>')
-        self.assertIn('已确认', self.hud.records_table.item(0, 1).text())
+        tree = self.hud.records_tree
+        group = tree.topLevelItem(0)
+        self.assertEqual(tree.topLevelItemCount(), 1)
+        self.assertEqual(group.childCount(), 2)
+        self.assertFalse(group.isExpanded())
+        tree.itemClicked.emit(group, 0)
+        self.assertTrue(group.isExpanded())
+        child = group.child(0)
+        self.assertEqual(child.text(0), '<script>example</script>')
+        self.assertIn('已确认', child.text(1))
+        tree.setCurrentItem(child)
+        self.hud.history_delete.click()
+        self.assertEqual(tree.topLevelItem(0).childCount(), 1)
+        self.assertTrue(tree.topLevelItem(0).isExpanded())
+        self.assertEqual(len(self.hud.last['recent_events']), 2)
+        self.hud._records_signature = None
+        self.hud._populate_records()
+        self.assertEqual(tree.topLevelItem(0).childCount(), 1)
         self.assertFalse(self.service.enabled)
         self.hud.records_dialog.close()
 

@@ -35,6 +35,30 @@ class TaskQueueTests(unittest.TestCase):
         self.assertEqual(self.store.list_tasks(), [])
         self.assertFalse(Path(self.path).exists())
 
+    def test_adopt_recovery_is_atomic_and_never_requeues_uncertain_delivery(self):
+        import codex_watchdog as core
+        with patch.object(core, 'STATE_DB', self.path):
+            con = core.state_connection()
+        item = dict(thread_id='existing-thread', turn_id='failed-turn', title='Original task', cwd=self.tmp.name)
+        con.execute("INSERT INTO resume_events(thread_id,failed_turn_id,title,cwd,state,created_at,updated_at) VALUES(?,?,?,?, 'pending',1,1)",
+                    (item['thread_id'], item['turn_id'], item['title'], item['cwd']))
+        con.commit()
+        try:
+            task = self.store.adopt_recovery(item)
+            self.assertEqual(task['thread_id'], item['thread_id'])
+            self.assertEqual(task['turn_id'], item['turn_id'])
+            self.assertTrue(task['external_recovery'])
+            self.assertEqual(task['status'], 'waiting_resume')
+            self.assertEqual(con.execute('SELECT state FROM resume_events').fetchone()[0], 'queue_owned')
+            self.assertIsNone(self.store.adopt_recovery(item))
+            self.assertEqual(len(self.store.list_tasks()), 1)
+            con.execute("UPDATE resume_events SET state='uncertain'")
+            con.commit()
+            self.assertIsNone(self.store.adopt_recovery(item))
+            self.assertEqual(self.store.get(task['id'])['status'], 'waiting_resume')
+        finally:
+            con.close()
+
     def test_validation_preserves_previous_tasks(self):
         first = self.store.submit(self.spec)
         for patch in ({'description':' \n'}, {'cwd':self.tmp.name+'/missing'},

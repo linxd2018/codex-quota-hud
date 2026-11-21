@@ -286,15 +286,17 @@ class TaskWorker:
             if not os.path.isdir(self.task['cwd']):
                 raise ValueError('工作目录不存在: ' + self.task['cwd'])
             self.server = self.server_factory(self.core, self.task.get('log_path'))
-            models = list_models(self.server)
-            config = self.server.request('config/read', {'includeLayers': False}).get('config', {})
+            external = self.task.get('external_recovery', False)
+            models = [] if external else list_models(self.server)
+            config = {} if external else self.server.request('config/read', {'includeLayers': False}).get('config', {})
             effective = dict(self.task)
             effective['model'] = self.task.get('model') or config.get('model') or next(
                 (m['model'] for m in models if m.get('isDefault')), '')
             selected_model = next((m for m in models if effective['model'] in (m.get('model'),m.get('id'))), {})
             effective['reasoning_effort'] = self.task.get('reasoning_effort') or (
                 config.get('model_reasoning_effort') if not self.task.get('model') else '') or selected_model.get('defaultReasoningEffort') or ''
-            validate_task(effective, models)
+            if not external:
+                validate_task(effective, models)
             self.save(effective_model=effective['model'], effective_reasoning_effort=effective['reasoning_effort'])
             common = {'cwd': self.task['cwd'], 'approvalPolicy': self.task['approval_policy'],
                       'sandbox': self.task['sandbox'], 'approvalsReviewer': 'user'}
@@ -304,7 +306,7 @@ class TaskWorker:
                 common['config'] = {'model_reasoning_effort': effective['reasoning_effort']}
             thread_id = self.task.get('thread_id')
             if thread_id:
-                result = self.server.request('thread/resume', dict(common, threadId=thread_id, excludeTurns=True))
+                result = self.server.request('thread/resume', dict({} if external else common, threadId=thread_id, excludeTurns=True))
                 status = result.get('thread', {}).get('status', {}).get('type')
                 if status == 'active':
                     raise TransportError('会话已有运行轮次，必须先核实，不能重复投递')
@@ -322,11 +324,12 @@ class TaskWorker:
                 self.created_thread = True
                 text = self.task['description']
             params = {'threadId': thread_id, 'input': [{'type': 'text', 'text': text}],
-                      'clientUserMessageId': self.task_id + ':' + str(self.task.get('attempts', 1)),
-                      'cwd': self.task['cwd'], 'approvalPolicy': self.task['approval_policy']}
-            if effective['model']:
+                      'clientUserMessageId': self.task_id + ':' + str(self.task.get('attempts', 1))}
+            if not external:
+                params.update(cwd=self.task['cwd'], approvalPolicy=self.task['approval_policy'])
+            if effective['model'] and not external:
                 params['model'] = effective['model']
-            if effective['reasoning_effort']:
+            if effective['reasoning_effort'] and not external:
                 params['effort'] = effective['reasoning_effort']
             if not self.allowed('turn'):
                 return
@@ -359,7 +362,11 @@ class TaskWorker:
         except BaseException as error:
             uncertain = self.ambiguous_operation or isinstance(error, TransportError) and bool(self.task.get('thread_id'))
             kind = 'uncertain' if uncertain else error_kind(error)
-            if kind == 'uncertain':
+            if (not uncertain and self.task.get('external_recovery') and isinstance(error, RpcError)
+                    and 'already has an active writer' in str(error).lower()):
+                self.finish('waiting_resume', '原会话仍被 Codex 占用，稍后自动重试', 'session_busy',
+                            retry_at=self.now() + 60)
+            elif kind == 'uncertain':
                 self.finish('failed', str(error), kind, phase='uncertain')
             elif kind == 'quota':
                 self.finish('waiting_quota', str(error), kind, retry_at=self.now() + 60)
